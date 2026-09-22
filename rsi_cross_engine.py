@@ -46,4 +46,4 @@ COOLDOWN_HOURS = 12
 
 def get_klines(symbol, interval=INTERVAL, limit=KLINES_LIMIT):
     params = {"symbol": symbol, "interval": interval, "limit": limit}
-    resp = requests.get(f"{FAPI_BASE}/fapi/v1/klines", params=params, timeout=20
+    resp = requests.get(f"{FAPI_BASE}/fapi/v1/klines", params=params, timeout=20)
