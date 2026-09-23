@@ -1,49 +1,33 @@
-import os
-import sys
-import requests
-from datetime import datetime, timezone
+name: RSI Cross Signal Engine
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
 
-if not SUPABASE_URL or not SUPABASE_KEY:
-    print("ERROR: SUPABASE_URL or SUPABASE_KEY missing.")
-    sys.exit(1)
+jobs:
+  run-engine:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-SB_HEADERS = {
-    "apikey": SUPABASE_KEY,
-    "Authorization": f"Bearer {SUPABASE_KEY}",
-    "Content-Type": "application/json",
-}
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-FAPI_BASE = "https://fapi.binance.com"
+      - name: Install dependencies
+        run: pip install requests
 
-SYMBOLS = [
-    "SNDKUSDT",
-    "ETHUSDT",
-    "DOGEUSDT",
-    "SNXXUSDT",
-    "SKHYNIXUSDT",
-    "BZUSDT",
-    "KAITOUSDT",
-    "HYPEUSDT",
-    "BTCUSDT",
-    "AGTUSDT",
-]
+      - name: Run signal engine
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python -u rsi_cross_engine.py
 
-INTERVAL = "1h"
-KLINES_LIMIT = 100
-
-RSI_FAST = 6
-RSI_MED = 14
-RSI_SLOW = 24
-
-STOP_LOSS_PCT = 0.02
-TARGET_PCT = 0.02
-
-COOLDOWN_HOURS = 12
-
-
-def get_klines(symbol, interval=INTERVAL, limit=KLINES_LIMIT):
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
-    resp = requests.get(f"{FAPI_BASE}/fapi/v1/klines", params=params, timeout=20)
+      - name: Check results
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python -u check_results.py
