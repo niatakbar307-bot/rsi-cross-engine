@@ -41,10 +41,10 @@ RSI_FAST = 6
 RSI_MED = 14
 RSI_SLOW = 24
 
-STOP_LOSS_PCT = 0.02   # فکسڈ 2%
-TARGET_PCT = 0.02      # فکسڈ 2%
-
-COOLDOWN_HOURS = 12
+# ATR کی بنیاد پر سٹاپ لاس اور ٹارگٹ (فکسڈ % کی بجائے)
+ATR_PERIOD = 14
+STOP_LOSS_ATR_MULT = 1.5
+TARGET_ATR_MULT = 2.0
 
 
 def get_klines(symbol, interval=INTERVAL, limit=KLINES_LIMIT):
@@ -54,15 +54,18 @@ def get_klines(symbol, interval=INTERVAL, limit=KLINES_LIMIT):
     return resp.json()
 
 
-def get_closed_closes(klines):
+def get_ohlc(klines):
     """
     Binance ہمیشہ آخری کینڈل کے طور پر ابھی جاری (ادھوری) کینڈل بھی بھیجتا ہے۔
-    ہم اسے ہٹا دیتے ہیں تاکہ صرف مکمل بند ہو چکی کینڈلز پر RSI کیلکولیٹ ہو —
-    ورنہ کراس ہر 5 منٹ بعد بدلتا رہے گا اور غیر مستحکم رہے گا۔
+    ہم اسے ہٹا دیتے ہیں تاکہ صرف مکمل بند ہو چکی کینڈلز پر RSI/ATR کیلکولیٹ ہو —
+    ورنہ کراس اور ATR ہر چند منٹ بعد بدلتے رہیں گے اور غیر مستحکم رہیں گے۔
     """
     if not klines:
-        return []
-    return [float(k[4]) for k in klines[:-1]]
+        return [], [], []
+    highs = [float(k[2]) for k in klines[:-1]]
+    lows = [float(k[3]) for k in klines[:-1]]
+    closes = [float(k[4]) for k in klines[:-1]]
+    return highs, lows, closes
 
 
 def calc_rsi(closes, period):
@@ -84,6 +87,29 @@ def calc_rsi(closes, period):
         rs = avg_gain / avg_loss if avg_loss != 0 else float("inf")
         rsi_values.append(100 - (100 / (1 + rs)))
     return rsi_values
+
+
+def calc_atr(highs, lows, closes, period=ATR_PERIOD):
+    """
+    Average True Range: مارکیٹ کی حقیقی volatility ناپتا ہے،
+    تاکہ SL/Target فکسڈ % کی بجائے ہر کوائن کی اپنی حرکت کے مطابق سیٹ ہوں۔
+    """
+    if len(closes) < period + 1:
+        return None
+    trs = []
+    for i in range(1, len(closes)):
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i] - closes[i - 1]),
+        )
+        trs.append(tr)
+    if len(trs) < period:
+        return None
+    atr = sum(trs[:period]) / period
+    for i in range(period, len(trs)):
+        atr = (atr * (period - 1) + trs[i]) / period
+    return atr
 
 
 def check_cross(closes):
@@ -130,41 +156,18 @@ def has_open_position(symbol):
     return len(resp.json()) > 0
 
 
-def is_in_cooldown(symbol, cooldown_hours=COOLDOWN_HOURS):
-    url = f"{SUPABASE_URL}/rest/v1/positions"
-    params = {
-        "symbol": f"eq.{symbol}",
-        "select": "created_at",
-        "order": "created_at.desc",
-        "limit": "1",
-    }
-    resp = requests.get(url, headers=SB_HEADERS, params=params, timeout=20)
-    resp.raise_for_status()
-    rows = resp.json()
-    if not rows:
-        return False
-
-    last_created = rows[0].get("created_at")
-    if not last_created:
-        return False
-
-    last_time = datetime.fromisoformat(last_created.replace("Z", "+00:00"))
-    elapsed_hours = (datetime.now(timezone.utc) - last_time).total_seconds() / 3600
-    return elapsed_hours < cooldown_hours
-
-
-def calc_levels(signal_type, entry_price):
+def calc_levels(signal_type, entry_price, atr):
     if signal_type == "BUY":
-        stop_loss = entry_price * (1 - STOP_LOSS_PCT)
-        target = entry_price * (1 + TARGET_PCT)
+        stop_loss = entry_price - (atr * STOP_LOSS_ATR_MULT)
+        target = entry_price + (atr * TARGET_ATR_MULT)
     else:
-        stop_loss = entry_price * (1 + STOP_LOSS_PCT)
-        target = entry_price * (1 - TARGET_PCT)
+        stop_loss = entry_price + (atr * STOP_LOSS_ATR_MULT)
+        target = entry_price - (atr * TARGET_ATR_MULT)
     return stop_loss, target
 
 
-def save_signal(symbol, signal_type, entry_price, rsi_snapshot):
-    stop_loss, target = calc_levels(signal_type, entry_price)
+def save_signal(symbol, signal_type, entry_price, rsi_snapshot, atr):
+    stop_loss, target = calc_levels(signal_type, entry_price, atr)
     positions_url = f"{SUPABASE_URL}/rest/v1/positions"
     payload = {
         "symbol": symbol,
@@ -180,7 +183,7 @@ def save_signal(symbol, signal_type, entry_price, rsi_snapshot):
     }
     r = requests.post(positions_url, headers=SB_HEADERS, json=payload, timeout=20)
     r.raise_for_status()
-    print(f"Signal saved: {symbol} -> {signal_type} @ {entry_price} (SL={stop_loss}, TP={target})")
+    print(f"Signal saved: {symbol} -> {signal_type} @ {entry_price} (ATR={atr:.6f}, SL={stop_loss}, TP={target})")
 
 
 def main():
@@ -191,7 +194,7 @@ def main():
     for symbol in SYMBOLS:
         try:
             klines = get_klines(symbol)
-            closes = get_closed_closes(klines)  # صرف بند ہو چکی کینڈلز
+            highs, lows, closes = get_ohlc(klines)  # صرف بند ہو چکی کینڈلز
 
             signal_type, rsi_snapshot = check_cross(closes)
 
@@ -199,11 +202,12 @@ def main():
                 if has_open_position(symbol):
                     print(f"Skip {symbol}: already has an open position.")
                     continue
-                if is_in_cooldown(symbol):
-                    print(f"Skip {symbol}: cooldown active.")
+                atr = calc_atr(highs, lows, closes)
+                if atr is None:
+                    print(f"Skip {symbol}: not enough data for ATR.")
                     continue
                 entry_price = closes[-1]
-                save_signal(symbol, signal_type, entry_price, rsi_snapshot)
+                save_signal(symbol, signal_type, entry_price, rsi_snapshot, atr)
                 signals_found += 1
             else:
                 print(f"{symbol}: no cross.")
