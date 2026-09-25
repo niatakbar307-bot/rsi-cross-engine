@@ -115,8 +115,15 @@ def calc_atr(highs, lows, closes, period=ATR_PERIOD):
 def check_cross(closes):
     """
     RSI(6) کا RSI(14) اور RSI(24) دونوں کو کراس کرنا:
-    - نیچے سے اوپر کراس (RSI6 دونوں سے کم تھا، اب دونوں سے زیادہ) -> BUY
-    - اوپر سے نیچے کراس (RSI6 دونوں سے زیادہ تھا، اب دونوں سے کم) -> SELL
+    - BUY: RSI6 پہلے دونوں سے اوپر نہیں تھا (کم از کم ایک سے نیچے/برابر)، اب دونوں سے اوپر ہے
+    - SELL: RSI6 پہلے دونوں سے نیچے نہیں تھا (کم از کم ایک سے اوپر/برابر)، اب دونوں سے نیچے ہے
+
+    نوٹ: پرانی شرط (was_below/was_above) بہت سخت تھی — وہ صرف اُس کینڈل کو پکڑتی تھی
+    جہاں RSI6 ایک ہی قدم میں دونوں لائنز سے نیچے سے دونوں کے اوپر (یا اس کے برعکس)
+    چلا جائے۔ حقیقت میں RSI6 عام طور پر پہلے ایک لائن کراس کرتا ہے، پھر کچھ دیر بعد
+    دوسری — اس لیے وہ سخت شرط اکثر کوئی کراس پکڑ ہی نہیں پاتی تھی۔ نیا منطق اس
+    لمحے کو پکڑتا ہے جب RSI6 آخری بار جس بھی ایک لائن سے نیچے (یا اوپر) تھا،
+    اُس سے بھی نکل کر دونوں سے اوپر (یا نیچے) ہو جائے۔
     """
     need = max(RSI_SLOW, RSI_MED, RSI_FAST) + 2
     if len(closes) < need:
@@ -135,14 +142,14 @@ def check_cross(closes):
 
     rsi_snapshot = {"rsi6": f_now, "rsi14": m_now, "rsi24": s_now}
 
-    was_below = f_prev <= m_prev and f_prev <= s_prev
+    was_not_above = not (f_prev > m_prev and f_prev > s_prev)
     now_above = f_now > m_now and f_now > s_now
-    if was_below and now_above:
+    if was_not_above and now_above:
         return "BUY", rsi_snapshot
 
-    was_above = f_prev >= m_prev and f_prev >= s_prev
+    was_not_below = not (f_prev < m_prev and f_prev < s_prev)
     now_below = f_now < m_now and f_now < s_now
-    if was_above and now_below:
+    if was_not_below and now_below:
         return "SELL", rsi_snapshot
 
     return None, rsi_snapshot
