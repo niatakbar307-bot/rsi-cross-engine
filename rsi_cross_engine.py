@@ -1,7 +1,6 @@
 import os
 import sys
 import requests
-from datetime import datetime, timezone
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
@@ -16,143 +15,121 @@ SB_HEADERS = {
     "Content-Type": "application/json",
 }
 
-# نوٹ: SNDK, SKHYNIX, SNXX, BZ جیسے Stock Perps صرف Futures مارکیٹ پر ہیں،
-# اس لیے یہاں Spot API (data-api.binance.vision) کی بجائے Futures API استعمال ہو رہا ہے۔
-FAPI_BASE = "https://fapi.binance.com"
+# Spot API استعمال ہو رہا ہے (futures fapi.binance.com کبھی کبھار
+# GitHub Actions کے سرورز کو geo-block کر دیتا ہے — 451 error)
+SPOT_BASE = "https://data-api.binance.vision"
 
-# آپ کی منتخب کردہ 10 علامتیں
-SYMBOLS = [
-    "SNDKUSDT",
-    "ETHUSDT",
-    "DOGEUSDT",
-    "SNXXUSDT",
-    "SKHYNIXUSDT",
-    "BZUSDT",
-    "KAITOUSDT",
-    "HYPEUSDT",
-    "BTCUSDT",
-    "AGTUSDT",
-]
+EXCLUDE_SUFFIXES = ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")
+EXCLUDE_BASES = {
+    "USDC", "FDUSD", "TUSD", "USDP", "USD1", "RLUSD", "U", "USDE", "BFUSD",
+    "XUSD", "PYUSD", "DAI", "USDS", "BUSD", "USDD", "FRAX", "LUSD",
+    "EUR", "EURI", "AEUR", "GBP", "TRY", "BRL", "ARS", "UAH", "PLN", "RON", "CZK", "JPY",
+}
 
 INTERVAL = "1h"
 KLINES_LIMIT = 100
+BREAKOUT_LOOKBACK = 24      # کم از کم 24 گھنٹے کی نئی بلندی
+MIN_QUOTE_VOLUME = 20_000_000  # کم از کم 24h USDT ٹرن اوور (پتلے کوائنز باہر)
+VOLUME_LOOKBACK = 20
+VOLUME_MULTIPLIER = 1.3     # حالیہ کینڈل کا volume اوسط سے کتنا زیادہ ہو
+MIN_RSI = 55                 # صرف تصدیق کے لیے، فیصلہ بریک آؤٹ کرتا ہے
 
-RSI_FAST = 6
-RSI_MED = 14
-RSI_SLOW = 24
-
-# ATR کی بنیاد پر سٹاپ لاس اور ٹارگٹ (فکسڈ % کی بجائے)
+RSI_PERIOD = 14
 ATR_PERIOD = 14
-STOP_LOSS_ATR_MULT = 1.5
-TARGET_ATR_MULT = 2.0
+ATR_STOP_MULTIPLIER = 2.5
+ATR_TARGET_MULTIPLIERS = (4.0, 6.0, 8.0, 10.0, 12.0)
+# غیر معمولی بڑے ATR کو حد میں رکھیں تاکہ سٹاپ/ٹارگٹ قابلِ حصول رہیں
+MAX_ATR_PCT_FOR_LEVELS = 0.02  # قیمت کا 2%
+
+
+def get_top_usdt_symbols(limit=150):
+    resp = requests.get(f"{SPOT_BASE}/api/v3/ticker/24hr", timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+    usdt_pairs = []
+    for d in data:
+        symbol = d["symbol"]
+        if not symbol.endswith("USDT") or symbol.endswith(EXCLUDE_SUFFIXES):
+            continue
+        if symbol[:-4] in EXCLUDE_BASES:
+            continue
+        try:
+            quote_volume = float(d["quoteVolume"])
+        except (KeyError, ValueError):
+            continue
+        if quote_volume < MIN_QUOTE_VOLUME:
+            continue
+        usdt_pairs.append((symbol, quote_volume))
+    usdt_pairs.sort(key=lambda x: x[1], reverse=True)
+    return [p[0] for p in usdt_pairs[:limit]]
 
 
 def get_klines(symbol, interval=INTERVAL, limit=KLINES_LIMIT):
     params = {"symbol": symbol, "interval": interval, "limit": limit}
-    resp = requests.get(f"{FAPI_BASE}/fapi/v1/klines", params=params, timeout=20)
+    resp = requests.get(f"{SPOT_BASE}/api/v3/klines", params=params, timeout=20)
     resp.raise_for_status()
     return resp.json()
 
 
-def get_ohlc(klines):
-    """
-    Binance ہمیشہ آخری کینڈل کے طور پر ابھی جاری (ادھوری) کینڈل بھی بھیجتا ہے۔
-    ہم اسے ہٹا دیتے ہیں تاکہ صرف مکمل بند ہو چکی کینڈلز پر RSI/ATR کیلکولیٹ ہو —
-    ورنہ کراس اور ATR ہر چند منٹ بعد بدلتے رہیں گے اور غیر مستحکم رہیں گے۔
-    """
-    if not klines:
-        return [], [], []
-    highs = [float(k[2]) for k in klines[:-1]]
-    lows = [float(k[3]) for k in klines[:-1]]
-    closes = [float(k[4]) for k in klines[:-1]]
-    return highs, lows, closes
-
-
-def calc_rsi(closes, period):
+def calc_rsi(closes, period=RSI_PERIOD):
     if len(closes) < period + 1:
-        return [None] * len(closes)
+        return None
     gains, losses = [], []
     for i in range(1, len(closes)):
         change = closes[i] - closes[i - 1]
         gains.append(max(change, 0))
         losses.append(max(-change, 0))
-    rsi_values = [None] * period
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
     rs = avg_gain / avg_loss if avg_loss != 0 else float("inf")
-    rsi_values.append(100 - (100 / (1 + rs)))
+    rsi = 100 - (100 / (1 + rs))
     for i in range(period, len(gains)):
         avg_gain = (avg_gain * (period - 1) + gains[i]) / period
         avg_loss = (avg_loss * (period - 1) + losses[i]) / period
         rs = avg_gain / avg_loss if avg_loss != 0 else float("inf")
-        rsi_values.append(100 - (100 / (1 + rs)))
-    return rsi_values
+        rsi = 100 - (100 / (1 + rs))
+    return rsi
 
 
 def calc_atr(highs, lows, closes, period=ATR_PERIOD):
-    """
-    Average True Range: مارکیٹ کی حقیقی volatility ناپتا ہے،
-    تاکہ SL/Target فکسڈ % کی بجائے ہر کوائن کی اپنی حرکت کے مطابق سیٹ ہوں۔
-    """
     if len(closes) < period + 1:
         return None
-    trs = []
+    true_ranges = []
     for i in range(1, len(closes)):
         tr = max(
             highs[i] - lows[i],
             abs(highs[i] - closes[i - 1]),
             abs(lows[i] - closes[i - 1]),
         )
-        trs.append(tr)
-    if len(trs) < period:
+        true_ranges.append(tr)
+    if len(true_ranges) < period:
         return None
-    atr = sum(trs[:period]) / period
-    for i in range(period, len(trs)):
-        atr = (atr * (period - 1) + trs[i]) / period
+    atr = sum(true_ranges[:period]) / period
+    for tr in true_ranges[period:]:
+        atr = (atr * (period - 1) + tr) / period
     return atr
 
 
-def check_cross(closes):
+def check_breakout(highs, closes, volumes):
     """
-    RSI(6) کا RSI(14) اور RSI(24) دونوں کو کراس کرنا:
-    - BUY: RSI6 پہلے دونوں سے اوپر نہیں تھا (کم از کم ایک سے نیچے/برابر)، اب دونوں سے اوپر ہے
-    - SELL: RSI6 پہلے دونوں سے نیچے نہیں تھا (کم از کم ایک سے اوپر/برابر)، اب دونوں سے نیچے ہے
-
-    نوٹ: پرانی شرط (was_below/was_above) بہت سخت تھی — وہ صرف اُس کینڈل کو پکڑتی تھی
-    جہاں RSI6 ایک ہی قدم میں دونوں لائنز سے نیچے سے دونوں کے اوپر (یا اس کے برعکس)
-    چلا جائے۔ حقیقت میں RSI6 عام طور پر پہلے ایک لائن کراس کرتا ہے، پھر کچھ دیر بعد
-    دوسری — اس لیے وہ سخت شرط اکثر کوئی کراس پکڑ ہی نہیں پاتی تھی۔ نیا منطق اس
-    لمحے کو پکڑتا ہے جب RSI6 آخری بار جس بھی ایک لائن سے نیچے (یا اوپر) تھا،
-    اُس سے بھی نکل کر دونوں سے اوپر (یا نیچے) ہو جائے۔
+    کم از کم BREAKOUT_LOOKBACK (24) گھنٹوں کی سب سے بلند قیمت سے اوپر بند ہونا،
+    ساتھ volume کی تصدیق اور RSI کی حمایت۔
     """
-    need = max(RSI_SLOW, RSI_MED, RSI_FAST) + 2
-    if len(closes) < need:
-        return None, None
+    if len(closes) < BREAKOUT_LOOKBACK + 2:
+        return False
 
-    rsi_fast = calc_rsi(closes, RSI_FAST)
-    rsi_med = calc_rsi(closes, RSI_MED)
-    rsi_slow = calc_rsi(closes, RSI_SLOW)
+    last_close = closes[-1]
+    prior_high = max(highs[-(BREAKOUT_LOOKBACK + 1):-1])  # موجودہ کینڈل سے پہلے کی بلندی
 
-    f_now, f_prev = rsi_fast[-1], rsi_fast[-2]
-    m_now, m_prev = rsi_med[-1], rsi_med[-2]
-    s_now, s_prev = rsi_slow[-1], rsi_slow[-2]
+    if last_close <= prior_high:
+        return False
 
-    if None in (f_now, f_prev, m_now, m_prev, s_now, s_prev):
-        return None, None
+    last_volume = volumes[-1]
+    avg_volume = sum(volumes[-(VOLUME_LOOKBACK + 1):-1]) / VOLUME_LOOKBACK
+    if avg_volume <= 0 or last_volume < avg_volume * VOLUME_MULTIPLIER:
+        return False
 
-    rsi_snapshot = {"rsi6": f_now, "rsi14": m_now, "rsi24": s_now}
-
-    was_not_above = not (f_prev > m_prev and f_prev > s_prev)
-    now_above = f_now > m_now and f_now > s_now
-    if was_not_above and now_above:
-        return "BUY", rsi_snapshot
-
-    was_not_below = not (f_prev < m_prev and f_prev < s_prev)
-    now_below = f_now < m_now and f_now < s_now
-    if was_not_below and now_below:
-        return "SELL", rsi_snapshot
-
-    return None, rsi_snapshot
+    return True
 
 
 def has_open_position(symbol):
@@ -163,61 +140,74 @@ def has_open_position(symbol):
     return len(resp.json()) > 0
 
 
-def calc_levels(signal_type, entry_price, atr):
-    if signal_type == "BUY":
-        stop_loss = entry_price - (atr * STOP_LOSS_ATR_MULT)
-        target = entry_price + (atr * TARGET_ATR_MULT)
-    else:
-        stop_loss = entry_price + (atr * STOP_LOSS_ATR_MULT)
-        target = entry_price - (atr * TARGET_ATR_MULT)
-    return stop_loss, target
+def calc_levels(entry_price, atr):
+    effective_atr = min(atr, entry_price * MAX_ATR_PCT_FOR_LEVELS)
+    stop_loss = entry_price - (effective_atr * ATR_STOP_MULTIPLIER)
+    targets = [entry_price + (effective_atr * m) for m in ATR_TARGET_MULTIPLIERS]
+    return stop_loss, targets
 
 
-def save_signal(symbol, signal_type, entry_price, rsi_snapshot, atr):
-    stop_loss, target = calc_levels(signal_type, entry_price, atr)
+def save_signal(symbol, entry_price, rsi, atr):
+    stop_loss, targets = calc_levels(entry_price, atr)
     positions_url = f"{SUPABASE_URL}/rest/v1/positions"
     payload = {
         "symbol": symbol,
-        "signal_type": signal_type,
+        "signal_type": "BUY",
         "entry_price": entry_price,
-        "rsi6": rsi_snapshot["rsi6"],
-        "rsi14": rsi_snapshot["rsi14"],
-        "rsi24": rsi_snapshot["rsi24"],
+        "rsi": rsi,
+        "atr": atr,
         "status": "open",
         "stop_loss": stop_loss,
-        "target_1": target,
+        "target_1": targets[0],
+        "target_2": targets[1],
+        "target_3": targets[2],
+        "target_4": targets[3],
+        "target_5": targets[4],
         "targets_hit": 0,
     }
     r = requests.post(positions_url, headers=SB_HEADERS, json=payload, timeout=20)
     r.raise_for_status()
-    print(f"Signal saved: {symbol} -> {signal_type} @ {entry_price} (ATR={atr:.6f}, SL={stop_loss}, TP={target})")
+    print(f"Signal saved: {symbol} -> BUY @ {entry_price} (24h breakout, ATR={atr}, SL={stop_loss}, TP1={targets[0]})")
 
 
 def main():
-    print("Starting RSI-cross signal engine (10-symbol test project)...")
+    print("Starting 24h Breakout engine...")
+
+    symbols = get_top_usdt_symbols()
+    print(f"Scanning {len(symbols)} symbols...")
 
     signals_found = 0
 
-    for symbol in SYMBOLS:
+    for symbol in symbols:
         try:
             klines = get_klines(symbol)
-            highs, lows, closes = get_ohlc(klines)  # صرف بند ہو چکی کینڈلز
+            klines = klines[:-1]  # ادھوری کینڈل ہٹائیں
 
-            signal_type, rsi_snapshot = check_cross(closes)
+            highs = [float(k[2]) for k in klines]
+            lows = [float(k[3]) for k in klines]
+            closes = [float(k[4]) for k in klines]
+            volumes = [float(k[5]) for k in klines]
 
-            if signal_type is not None:
-                if has_open_position(symbol):
-                    print(f"Skip {symbol}: already has an open position.")
-                    continue
-                atr = calc_atr(highs, lows, closes)
-                if atr is None:
-                    print(f"Skip {symbol}: not enough data for ATR.")
-                    continue
-                entry_price = closes[-1]
-                save_signal(symbol, signal_type, entry_price, rsi_snapshot, atr)
-                signals_found += 1
-            else:
-                print(f"{symbol}: no cross.")
+            if not check_breakout(highs, closes, volumes):
+                continue
+
+            rsi = calc_rsi(closes)
+            if rsi is None or rsi < MIN_RSI:
+                print(f"Skip {symbol}: RSI {rsi} below {MIN_RSI}.")
+                continue
+
+            if has_open_position(symbol):
+                print(f"Skip {symbol}: already has an open position.")
+                continue
+
+            atr = calc_atr(highs, lows, closes)
+            if not atr or atr <= 0:
+                print(f"Skip {symbol}: invalid ATR.")
+                continue
+
+            entry_price = closes[-1]
+            save_signal(symbol, entry_price, rsi, atr)
+            signals_found += 1
 
         except Exception as e:
             print(f"Error processing {symbol}: {e}")
