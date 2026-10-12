@@ -32,7 +32,6 @@ BREAKOUT_LOOKBACK = 24      # کم از کم 24 گھنٹے کی نئی بلند�
 MIN_QUOTE_VOLUME = 20_000_000  # کم از کم 24h USDT ٹرن اوور (پتلے کوائنز باہر)
 VOLUME_LOOKBACK = 20
 VOLUME_MULTIPLIER = 1.3     # حالیہ کینڈل کا volume اوسط سے کتنا زیادہ ہو
-MIN_RSI = 55                 # صرف تصدیق کے لیے، فیصلہ بریک آؤٹ کرتا ہے
 
 RSI_PERIOD = 14
 ATR_PERIOD = 14
@@ -166,6 +165,8 @@ def save_signal(symbol, entry_price, rsi, atr):
         "targets_hit": 0,
     }
     r = requests.post(positions_url, headers=SB_HEADERS, json=payload, timeout=20)
+    if not r.ok:
+        print(f"Save failed for {symbol}: {r.status_code} {r.text}")
     r.raise_for_status()
     print(f"Signal saved: {symbol} -> BUY @ {entry_price} (24h breakout, ATR={atr}, SL={stop_loss}, TP1={targets[0]})")
 
@@ -192,18 +193,18 @@ def main():
                 continue
 
             rsi = calc_rsi(closes)
-            if rsi is None or rsi < MIN_RSI:
-                print(f"Skip {symbol}: RSI {rsi} below {MIN_RSI}.")
-                continue
 
             if has_open_position(symbol):
                 print(f"Skip {symbol}: already has an open position.")
                 continue
 
             atr = calc_atr(highs, lows, closes)
-            if not atr or atr <= 0:
+            if not atr or atr <= 0 or atr != atr or atr in (float("inf"), float("-inf")):
                 print(f"Skip {symbol}: invalid ATR.")
                 continue
+            if rsi is not None and (rsi != rsi or rsi in (float("inf"), float("-inf"))):
+                print(f"Skip {symbol}: invalid RSI, saving without it.")
+                rsi = None
 
             entry_price = closes[-1]
             save_signal(symbol, entry_price, rsi, atr)
