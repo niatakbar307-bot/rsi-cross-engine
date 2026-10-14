@@ -28,10 +28,10 @@ EXCLUDE_BASES = {
 
 INTERVAL = "1h"
 KLINES_LIMIT = 100
-BREAKOUT_LOOKBACK = 24      # کم از کم 24 گھنٹے کی نئی بلندی
-MIN_QUOTE_VOLUME = 20_000_000  # کم از کم 24h USDT ٹرن اوور (پتلے کوائنز باہر)
+BREAKOUT_LOOKBACK = 6       # کم از کم 6 گھنٹے کی نئی بلندی (12/24 گھنٹے نایاب ثابت ہوئے)
+MIN_QUOTE_VOLUME = 5_000_000  # کم از کم 24h USDT ٹرن اوور
 VOLUME_LOOKBACK = 20
-VOLUME_MULTIPLIER = 1.3     # حالیہ کینڈل کا volume اوسط سے کتنا زیادہ ہو
+VOLUME_MULTIPLIER = 1.05    # حالیہ کینڈل کا volume اوسط سے کتنا زیادہ ہو (مزید نرم)
 
 RSI_PERIOD = 14
 ATR_PERIOD = 14
@@ -111,8 +111,8 @@ def calc_atr(highs, lows, closes, period=ATR_PERIOD):
 
 def check_breakout(highs, closes, volumes):
     """
-    کم از کم BREAKOUT_LOOKBACK (24) گھنٹوں کی سب سے بلند قیمت سے اوپر بند ہونا،
-    ساتھ volume کی تصدیق اور RSI کی حمایت۔
+    کم از کم BREAKOUT_LOOKBACK گھنٹوں کی سب سے بلند قیمت سے اوپر بند ہونا،
+    ساتھ volume کی تصدیق۔
     """
     if len(closes) < BREAKOUT_LOOKBACK + 2:
         return False
@@ -172,7 +172,7 @@ def save_signal(symbol, entry_price, rsi, atr):
 
 
 def main():
-    print("Starting 24h Breakout engine...")
+    print(f"Starting {BREAKOUT_LOOKBACK}h Breakout engine...")
 
     symbols = get_top_usdt_symbols()
     print(f"Scanning {len(symbols)} symbols...")
